@@ -30,7 +30,7 @@ def log(*value, sep=' ', end='\n', file=sys.stderr, flush=False):
     print('http-simulator:', *value, sep=sep, end=end, file=file, flush=flush)
 
 
-# a=b,c=d => {a: b, c: d}
+# "a=b,c=d" => {"a": "b", "c": "d"}
 #
 def value_dict(value):
     if not value:
@@ -43,6 +43,7 @@ def value_dict(value):
         except ValueError:
             pass
     return {}
+
 
 # http handler for serving up simulated resources
 #
@@ -96,6 +97,7 @@ class SimulatorHandler(http.server.BaseHTTPRequestHandler):
         if set_values:
             headers = json.dumps(self.select_headers(self.headers, set_values))
             url = urllib.parse.urlparse(self.path)
+            db.execute(queries.clear, (self.command, url.path))
             db.execute(queries.insert, (status, self.command, url.path, url.query, headers, body))
             self.send_response(205)
             self.end_headers()
@@ -153,7 +155,7 @@ def restarter():
 
 class queries:
     create = """
-    CREATE TABLE IF NOT EXISTS cabbage_resources (
+    CREATE TABLE IF NOT EXISTS simulated_resources (
         status INT NOT NULL,
         method TEXT NOT NULL,
         path TEXT NOT NULL,
@@ -164,15 +166,19 @@ class queries:
     """
 
     insert = """
-    INSERT INTO cabbage_resources (status, method, path, query, headers, body) VALUES (?, ?, ?, ?, ?, ?);
+    INSERT INTO simulated_resources (status, method, path, query, headers, body) VALUES (?, ?, ?, ?, ?, ?);
     """
 
     resource = """
-    SELECT * FROM cabbage_resources WHERE method = ? AND path = ?;
+    SELECT * FROM simulated_resources WHERE method = ? AND path = ?;
     """
 
     resource_qs = """
-    SELECT * FROM cabbage_resources WHERE method = ? AND path = ? AND query = ?;
+    SELECT * FROM simulated_resources WHERE method = ? AND path = ? AND query = ?;
+    """
+
+    clear = """
+    DELETE FROM simulated_resources WHERE method = ? AND path = ?;
     """
 
 
@@ -180,13 +186,13 @@ def init_db(db):
     db.execute(queries.create)
 
     ## temp
-    db.execute("insert into cabbage_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
+    db.execute("insert into simulated_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
                    (201, 'POST', '/where/to/test', None, '[]', 'f=a\nb=3'))
 
-    db.execute("insert into cabbage_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
+    db.execute("insert into simulated_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
                    (202, 'GET', '/where/to/test', None, '[]', 'f=a\nb=3'))
 
-    log('records {}'.format( list(db.execute('select * from cabbage_resources'))))
+    log('records {}'.format( list(db.execute('select * from simulated_resources'))))
 
 
 # Reads and validates command line args, then configures the script
@@ -195,7 +201,7 @@ def init_db(db):
 def config(args):
     mem_db = ':memory:'
     fmt_cls = argparse.ArgumentDefaultsHelpFormatter
-    desc = 'Serve cabbage.'
+    desc = 'Serve HTTP responses simulated with HTTP requests.'
 
     parser = argparse.ArgumentParser(description=desc, formatter_class=fmt_cls)
     parser.add_argument('-b', '--bind', dest='bind', default='*:8000',
