@@ -1,16 +1,7 @@
 #!/usr/bin/env python
-""" This script simulates HTTP the way you like.
+""" Simulate HTTP responses with HTTP requests.
 
-First, start a server:
-
-    $ ./http-simulator
-    $ echo or python3 ./http-simulator
-    $ echo or curl http://... | python3
-
-Then, from a different terminal:
-
-    $ http POST :8000/path/to/test X-Simulate-Set:status=302 X-Location:/
-
+See README.md and LICENSE files in this directory.
 
 """
 import argparse
@@ -30,22 +21,7 @@ def log(*value, sep=' ', end='\n', file=sys.stderr, flush=False):
     print('http-simulator:', *value, sep=sep, end=end, file=file, flush=flush)
 
 
-# "a=b,c=d" => {"a": "b", "c": "d"}
-#
-def value_dict(value):
-    if not value:
-        value = ''
-    if len(value):
-        value = value[0]
-    if value:
-        try:
-            return {k: v for (k, v) in [pair.split('=') for pair in value.split(',')]}
-        except ValueError:
-            pass
-    return {}
-
-
-# http handler for serving up simulated resources
+# http handler for serving up simulated routes
 #
 class SimulatorHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -55,58 +31,74 @@ class SimulatorHandler(http.server.BaseHTTPRequestHandler):
         db = self.server.conf.db_conn
         url = urllib.parse.urlparse(self.path)
 
-        select = queries.resource
+        select = queries.route
         args = [self.command, url.path]
 
         # if self.read_match_headers():
-        #     select = queries.resource_qs
+        #     select = queries.route_qs
         #     args.append(url.query)
 
         return list(db.execute(select, args))
 
 
+    # can mutate
+    select_header_defaults = ['Content-Type', 'Content-Length', 'Location']
+
     def select_headers(self, all_headers, value_lookup):
         save = []
-        default_headers = ['Content-Type', 'Content-Length', 'Location']
+        presets = {
+            'default': lambda v: v in self.select_header_defaults,
+            'always':  lambda v: True,
+            'all-nox': lambda v: not v.startswith('X-'),
+            'xs': lambda v: v.startswith('X-'),
+            }
 
-        which = value_lookup.get('headers', 'default')
-        pred = lambda v: False
+        for which in value_lookup.get('headers', ['default']):
+            match = lambda v: v == which
+            pred = presets.get(which, match)
 
-        if which == 'default':
-            pred = lambda v: v in default_headers
-        elif which == 'all':
-            pred = lambda v: True
-        elif which == 'xs':
-            pred = lambda v: v.startswith('X-')
-
-        for k, v in all_headers.items():
-            if pred(k):
-                save.append((k, v))
+            for pair in [(k, v) for k, v in all_headers.items() if pred(k)]:
+                save.append(pair)
 
         return save
 
     def do(self):
-        set_values = value_dict(self.headers.get_all('x-simulator-set', []))
-        match_values = value_dict(self.headers.get_all('x-simulator-match', []))
-
+        sim_set = self.headers.get('x-simulator-set', '').replace(',', '&')
+        set_values = urllib.parse.parse_qs(sim_set)
         db = self.server.conf.db_conn
-        content_len = int(self.headers.get('content-length', 0))
-        body = self.rfile.read(content_len)
-        status = int(set_values.get('status', 200))
 
+        # set the router to match
         if set_values:
-            headers = json.dumps(self.select_headers(self.headers, set_values))
+            headers = self.headers
+            content_len = int(headers.get('content-length', 0))
+            body = self.rfile.read(content_len)
+            if len(body) == 0 and headers.get('content-length', None) is None:
+                headers['Content-Length'] = '0'
+            headers = self.select_headers(headers, set_values)
+            headers = json.dumps(headers)
+
+            status = int(set_values.get('status', [200])[0])
             url = urllib.parse.urlparse(self.path)
-            db.execute(queries.clear, (self.command, url.path))
-            db.execute(queries.insert, (status, self.command, url.path, url.query, headers, body))
-            self.send_response(205)
-            self.end_headers()
+
+            if not self.server.conf.read_only:
+                c = db.cursor()
+                c.execute(queries.clear, (self.command, url.path, url.query))
+                c.execute(queries.insert, (status, self.command, url.path, url.query, headers, body))
+                db.commit()
+                self.send_response(205)
+                self.end_headers()
+            else:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b'Simulator is read-only.')
             return
 
+        # serve instead
         replay = self.lookup()
         if replay:
             status, method, path, qs, headers, body = record = replay[0]
-            self.send_response(status)
+
+            self.send_response(int(status))
             try:
                 headers = json.loads(headers)
             except:
@@ -114,10 +106,11 @@ class SimulatorHandler(http.server.BaseHTTPRequestHandler):
             for k, v in headers:
                 self.send_header(k, v)
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
             return
 
-        # no patch, no serve, no soup for you
+        # no set, no serve, no soup for you
         self.send_response(404)
         self.end_headers()
         return
@@ -138,9 +131,10 @@ def run_server(conf):
 
     log('serving on {}:{}'.format(host if host else '*', port))
     httpd.serve_forever()
+    return 0
 
 
-# Restarts this script when it changes.
+# restarts this script when it changes
 #
 def restarter():
     mod_time = lambda: os.stat(__file__).st_mtime
@@ -153,50 +147,47 @@ def restarter():
             p = sys.executable
             os.execl(p, p, *sys.argv)
 
+
+# sql bits grouped in a class
+#
 class queries:
     create = """
-    CREATE TABLE IF NOT EXISTS simulated_resources (
+    CREATE TABLE IF NOT EXISTS sim_routes (
         status INT NOT NULL,
         method TEXT NOT NULL,
         path TEXT NOT NULL,
-        query TEXT,
+        query TEXT NOT NULL,
         headers TEXT,
         body BLOB
     );
     """
 
     insert = """
-    INSERT INTO simulated_resources (status, method, path, query, headers, body) VALUES (?, ?, ?, ?, ?, ?);
+    INSERT INTO sim_routes (status, method, path, query, headers, body)
+    VALUES (?, ?, ?, ?, ?, ?);
     """
 
-    resource = """
-    SELECT * FROM simulated_resources WHERE method = ? AND path = ?;
+    route = """
+    SELECT * FROM sim_routes WHERE method = ? AND path = ?;
     """
 
-    resource_qs = """
-    SELECT * FROM simulated_resources WHERE method = ? AND path = ? AND query = ?;
+    route_qs = """
+    SELECT * FROM sim_routes WHERE method = ? AND path = ? AND query = ?;
     """
 
     clear = """
-    DELETE FROM simulated_resources WHERE method = ? AND path = ?;
+    DELETE FROM sim_routes WHERE method = ? AND path = ? AND query = ?;
     """
 
 
+# create the initial table, log count of existing records
 def init_db(db):
     db.execute(queries.create)
-
-    ## temp
-    db.execute("insert into simulated_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
-                   (201, 'POST', '/where/to/test', None, '[]', 'f=a\nb=3'))
-
-    db.execute("insert into simulated_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
-                   (202, 'GET', '/where/to/test', None, '[]', 'f=a\nb=3'))
-
-    log('records {}'.format( list(db.execute('select * from simulated_resources'))))
+    log('record count: {}'.format(list(db.execute('select * from sim_routes'))))
 
 
-# Reads and validates command line args, then configures the script
-# environment.  Returns the augmented configuration.
+# reads and validates command line args, then configures the script
+# environment; returns the augmented configuration
 #
 def config(args):
     mem_db = ':memory:'
@@ -210,7 +201,7 @@ def config(args):
                             help='sqlite3 database filename')
     parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
                             help='quiet output')
-    parser.add_argument('-r', '--read-only', dest='ro', action='store_true',
+    parser.add_argument('-r', '--read-only', dest='read_only', action='store_true',
                             help='do not write to the database')
     parser.add_argument('-w', '--watch', dest='watch', action='store_true',
                             help='watch the script for changes and restart')
@@ -233,7 +224,7 @@ def config(args):
         conf.host = host
         conf.port = port
 
-    if conf.db == mem_db and conf.ro:
+    if conf.db == mem_db and conf.read_only:
         log_err('read only memory only db will not do anything; exiting.')
         sys.exit(2)
 
