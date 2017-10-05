@@ -1,0 +1,253 @@
+#!/usr/bin/env python
+""" This script simulates HTTP the way you like.
+
+First, start a server:
+
+    $ ./http-simulator
+    $ echo or python3 ./http-simulator
+    $ echo or curl http://... | python3
+
+Then, from a different terminal:
+
+    $ http POST :8000/path/to/test X-Simulate-Set:status=302 X-Location:/
+
+
+"""
+import argparse
+import http.server
+import json
+import os
+import sqlite3
+import sys
+import threading
+import time
+import urllib.parse
+
+
+# logger, potentially overwritten by config
+#
+def log(*value, sep=' ', end='\n', file=sys.stderr, flush=False):
+    print('http-simulator:', *value, sep=sep, end=end, file=file, flush=flush)
+
+
+# a=b,c=d => {a: b, c: d}
+#
+def value_dict(value):
+    if not value:
+        value = ''
+    if len(value):
+        value = value[0]
+    if value:
+        try:
+            return {k: v for (k, v) in [pair.split('=') for pair in value.split(',')]}
+        except ValueError:
+            pass
+    return {}
+
+# http handler for serving up simulated resources
+#
+class SimulatorHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        log(fmt % args)
+
+    def lookup(self):
+        db = self.server.conf.db_conn
+        url = urllib.parse.urlparse(self.path)
+
+        select = queries.resource
+        args = [self.command, url.path]
+
+        # if self.read_match_headers():
+        #     select = queries.resource_qs
+        #     args.append(url.query)
+
+        return list(db.execute(select, args))
+
+
+    def select_headers(self, all_headers, value_lookup):
+        save = []
+        default_headers = ['Content-Type', 'Content-Length', 'Location']
+
+        which = value_lookup.get('headers', 'default')
+        pred = lambda v: False
+
+        if which == 'default':
+            pred = lambda v: v in default_headers
+        elif which == 'all':
+            pred = lambda v: True
+        elif which == 'xs':
+            pred = lambda v: v.startswith('X-')
+
+        for k, v in all_headers.items():
+            if pred(k):
+                save.append((k, v))
+
+        return save
+
+    def do(self):
+        set_values = value_dict(self.headers.get_all('x-simulator-set', []))
+        match_values = value_dict(self.headers.get_all('x-simulator-match', []))
+
+        db = self.server.conf.db_conn
+        content_len = int(self.headers.get('content-length', 0))
+        body = self.rfile.read(content_len)
+        status = int(set_values.get('status', 200))
+
+        if set_values:
+            headers = json.dumps(self.select_headers(self.headers, set_values))
+            url = urllib.parse.urlparse(self.path)
+            db.execute(queries.insert, (status, self.command, url.path, url.query, headers, body))
+            self.send_response(205)
+            self.end_headers()
+            return
+
+        replay = self.lookup()
+        if replay:
+            status, method, path, qs, headers, body = record = replay[0]
+            self.send_response(status)
+            try:
+                headers = json.loads(headers)
+            except:
+                headers = []
+            for k, v in headers:
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # no patch, no serve, no soup for you
+        self.send_response(404)
+        self.end_headers()
+        return
+
+
+    do_ANY = do_DELETE = do_GET = do_HEAD = do_PATCH = do_POST = do_PUT = do_TRACE = do
+
+
+# configures and runs an http server with our handler
+#
+def run_server(conf):
+    handler = SimulatorHandler
+    host = conf.host
+    port = conf.port
+
+    httpd = http.server.HTTPServer((host, port), handler)
+    httpd.conf = conf
+
+    log('serving on {}:{}'.format(host if host else '*', port))
+    httpd.serve_forever()
+
+
+# Restarts this script when it changes.
+#
+def restarter():
+    mod_time = lambda: os.stat(__file__).st_mtime
+    first = mod_time()
+    while True:
+        time.sleep(1)
+        now = mod_time()
+        if now != first:
+            log('restart - mod time was {} now {}'.format(first, now))
+            p = sys.executable
+            os.execl(p, p, *sys.argv)
+
+class queries:
+    create = """
+    CREATE TABLE IF NOT EXISTS cabbage_resources (
+        status INT NOT NULL,
+        method TEXT NOT NULL,
+        path TEXT NOT NULL,
+        query TEXT,
+        headers TEXT,
+        body BLOB
+    );
+    """
+
+    insert = """
+    INSERT INTO cabbage_resources (status, method, path, query, headers, body) VALUES (?, ?, ?, ?, ?, ?);
+    """
+
+    resource = """
+    SELECT * FROM cabbage_resources WHERE method = ? AND path = ?;
+    """
+
+    resource_qs = """
+    SELECT * FROM cabbage_resources WHERE method = ? AND path = ? AND query = ?;
+    """
+
+
+def init_db(db):
+    db.execute(queries.create)
+
+    ## temp
+    db.execute("insert into cabbage_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
+                   (201, 'POST', '/where/to/test', None, '[]', 'f=a\nb=3'))
+
+    db.execute("insert into cabbage_resources (status, method, path, query, headers, body) values (?, ?, ?, ?, ?, ?)",
+                   (202, 'GET', '/where/to/test', None, '[]', 'f=a\nb=3'))
+
+    log('records {}'.format( list(db.execute('select * from cabbage_resources'))))
+
+
+# Reads and validates command line args, then configures the script
+# environment.  Returns the augmented configuration.
+#
+def config(args):
+    mem_db = ':memory:'
+    fmt_cls = argparse.ArgumentDefaultsHelpFormatter
+    desc = 'Serve cabbage.'
+
+    parser = argparse.ArgumentParser(description=desc, formatter_class=fmt_cls)
+    parser.add_argument('-b', '--bind', dest='bind', default='*:8000',
+                            help='bind to host:port')
+    parser.add_argument('-d', '--database', dest='db', default=mem_db,
+                            help='sqlite3 database filename')
+    parser.add_argument('-q', '--quiet', dest='quiet', action='store_true',
+                            help='quiet output')
+    parser.add_argument('-r', '--read-only', dest='ro', action='store_true',
+                            help='do not write to the database')
+    parser.add_argument('-w', '--watch', dest='watch', action='store_true',
+                            help='watch the script for changes and restart')
+    global log
+    log_err = log
+    conf = parser.parse_args(args)
+
+    if conf.quiet:
+        log = lambda *a, **b: None
+
+    try:
+        host, port = conf.bind.split(':')
+        if host == '*':
+            host = ''
+        port = int(port)
+    except:
+        log_err('invalid host:port for bind')
+        sys.exit(1)
+    else:
+        conf.host = host
+        conf.port = port
+
+    if conf.db == mem_db and conf.ro:
+        log_err('read only memory only db will not do anything; exiting.')
+        sys.exit(2)
+
+    try:
+        conf.db_conn = sqlite3.connect(conf.db)
+    except Exception as exc:
+        log_err('failed to connect to database:', exc)
+        sys.exit(3)
+    else:
+        init_db(conf.db_conn)
+
+    if conf.watch:
+        restarter_thread = threading.Thread(target=restarter, daemon=True)
+        restarter_thread.start()
+
+    return conf
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(run_server(config(sys.argv[1:])))
+    except KeyboardInterrupt:
+        pass
